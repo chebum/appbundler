@@ -30,6 +30,7 @@
 #include <pwd.h>
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#include <sys/vmmeter.h>
 
 #define JAVA_LAUNCH_ERROR "JavaLaunchError"
 
@@ -123,15 +124,24 @@ int main(int argc, char *argv[]) {
 }
 
 
-// Get the amount of physical RAM on this machine
-int64_t get_ram_size() {
-    int mib[2] = {CTL_HW, HW_MEMSIZE};
-    int64_t physical_memory;
-    size_t length = sizeof(int64_t);
-    if(sysctl(mib, 2, &physical_memory, &length, NULL, 0)==0) {
-        return physical_memory;
+size_t get_free_ram_size() {
+    mach_port_t host_port;
+    mach_msg_type_number_t host_size;
+    vm_size_t pagesize;
+
+    host_port = mach_host_self();
+    host_size = sizeof(vm_statistics_data_t) / sizeof(integer_t);
+    host_page_size(host_port, &pagesize);
+
+    vm_statistics_data_t vm_stat;
+
+    if (host_statistics(host_port, HOST_VM_INFO, (host_info_t)&vm_stat, &host_size) != KERN_SUCCESS) {
+        Log(@"Failed to fetch vm statistics");
     }
-    return 0;
+    
+    __uint64_t mem_free = (((__uint64_t)(vm_stat.free_count + vm_stat.inactive_count)) * pagesize) / 1048576;
+    
+    return (size_t) mem_free;
 }
 
 
@@ -158,11 +168,13 @@ int launch(char *commandName, int progargc, char *progargv[]) {
     bool isDebugging = (launchCount > 0) && [[infoDictionary objectForKey:@JVM_DEBUG_KEY] boolValue];
 
     Log(@"\n\n\n\nLoading Application '%@'", [infoDictionary objectForKey:@"CFBundleName"]);
+    
+    NSString *mainBundlePath = [mainBundle bundlePath];
 
     // Set the working directory based on config, defaulting to the user's home directory
     NSString *workingDir = [infoDictionary objectForKey:@WORKING_DIR];
     if (workingDir != nil) {
-        workingDir = [workingDir stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:[mainBundle bundlePath]];
+        workingDir = [workingDir stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:mainBundlePath];
 
         Log(@"Working Directory: '%@'", convertRelativeFilePath(workingDir));
 
@@ -300,7 +312,6 @@ int launch(char *commandName, int progargc, char *progargv[]) {
 
     // Set the class path
     NSFileManager *defaultFileManager = [NSFileManager defaultManager];
-    NSString *mainBundlePath = [mainBundle bundlePath];
 
     // make sure the bundle path does not contain a colon, as that messes up the java.class.path,
     // because colons are used a path separators and cannot be escaped.
@@ -473,7 +484,7 @@ int launch(char *commandName, int progargc, char *progargv[]) {
             int k = 0;
             for (NSString *file in cp) {
                 if (k++ > 0) [classPath appendString:@":"]; // add separator if needed
-                file = [file stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:[mainBundle bundlePath]];
+                file = [file stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:mainBundlePath];
                 [classPath appendString:file];
             }
         }
@@ -579,34 +590,55 @@ int launch(char *commandName, int progargc, char *progargv[]) {
         }
     }
 
-    // replace $APP_ROOT in environment variables
+    Log(@"Removing environment variables");
+    NSArray *forbiddenEnvVariables = @[@"CLASSPATH", @"_JAVA_VERSION_SET", @"_JAVA_SPLASH_FILE", @"_JAVA_SPLASH_JAR", @"JDK_JAVA_OPTIONS", @"JDK_ALTERNATE_VM", @"_JAVA_OPTIONS", @"_JAVA_LAUNCHER_DEBUG", @"LIBJVM_DTRACE_DEBUG", @"JAVA2D_FONTPATH", @"J2D_D3D", @"J2D_D3D_PRELOAD", @"USERNAME"];
+    for (NSString *key in forbiddenEnvVariables) {
+        unsetenv([key UTF8String]);
+    }
+    
+    Log(@"Replacing $APP_ROOT in environment variables with '%@'", mainBundlePath);
     NSDictionary* environment = [[NSProcessInfo processInfo] environment];
     for (NSString* key in environment) {
+        if (!key || key == (id)[NSNull null])
+            continue;
         NSString* value = [environment objectForKey:key];
-        NSString* newValue = [value stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:[mainBundle bundlePath]];
-        if (! [newValue isEqualToString:value]) {
+        if (value && value != (id)[NSNull null] && [value containsString:@"$APP_ROOT"]) {
+            Log(@"Expanding value of %s variable", key);
+            NSString* newValue = [value stringByReplacingOccurrencesOfString:@"$APP_ROOT" withString:mainBundlePath];
             setenv([key UTF8String], [newValue UTF8String], 1);
         }
     }
     
-    // replace any maximum memory parameters that specify a percentage of available ram
+    int ram_size = get_free_ram_size(),
+        max_xmx_value = MAX(ram_size / 2, 250);
+    Log(@"Replacing any maximum memory parameters that specify a percentage of available ram: %u", ram_size);
     for(int i=0; i<options.count; i++) {
         NSString* option = [options objectAtIndex:i];
-        if([option hasPrefix:@"-Xmx"] && [option hasSuffix:@"%"]) {
-            NSString* percentAmtStr = [option substringWithRange:NSMakeRange(4, option.length-5)];
-            double percentAmt = percentAmtStr.doubleValue;
-            if(percentAmt >= 1 && percentAmt <= 200.0001) {
-                int64_t ram_size = get_ram_size();
-                if(ram_size > 0 ) {
-                    double ramToUse = (percentAmt/100) * ram_size;
-                    ramToUse = ramToUse/1000000; // convert from bytes to megabytes
-                    [options replaceObjectAtIndex:i withObject:[NSString stringWithFormat:@"-Xmx%0.0fm", ramToUse]];
+        if([option hasPrefix:@"-Xmx"]) {
+            if([option hasSuffix:@"%"]) {
+                if (ram_size <=0) {
+                    Log(@"Cannot find free memory, removing Xmx parameter");
+                    [options removeObjectAtIndex:i];
+                    continue;
+                }
+                
+                NSString* percentAmtStr = [option substringWithRange:NSMakeRange(4, option.length-5)];
+                double percentAmt = percentAmtStr.doubleValue;
+                if(percentAmt >= 1 && percentAmt <= 95) {
+                    int ramToUse = (percentAmt/100) * ram_size;
+                    [options replaceObjectAtIndex:i withObject:[NSString stringWithFormat:@"-Xmx%dm", ramToUse]];
+                }
+            } else {
+                NSString* amtStr = [option substringWithRange:NSMakeRange(4, option.length-5)];
+                int amt = amtStr.intValue;
+                if (amt > max_xmx_value) {
+                    [options replaceObjectAtIndex:i withObject:[NSString stringWithFormat:@"-Xmx%dm", max_xmx_value]];
                 }
             }
         }
     }
     
-    // Initialize the arguments to JLI_Launch()
+    Log(@"Initialize the arguments to JLI_Launch()");
     // +5 due to the special directories and the sandbox enabled property
     int argc = 1 + [systemArguments count] + [options count] + [defaultOptions count] + 1 + [arguments count] + newProgargc;
     if (runningModule)
@@ -621,14 +653,14 @@ int launch(char *commandName, int progargc, char *progargv[]) {
     }
 
     for (NSString *option in options) {
-        option = [option stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:[mainBundle bundlePath]];
+        option = [option stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:mainBundlePath];
         option = [option stringByReplacingOccurrencesOfString:@JVM_RUNTIME withString:runtimePath];
         argv[i++] = strdup([option UTF8String]);
         Log(@"Option: %@",option);
     }
 
     for (NSString *defaultOption in defaultOptions) {
-        defaultOption = [defaultOption stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:[mainBundle bundlePath]];
+        defaultOption = [defaultOption stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:mainBundlePath];
         argv[i++] = strdup([defaultOption UTF8String]);
         Log(@"DefaultOption: %@",defaultOption);
     }
@@ -640,7 +672,7 @@ int launch(char *commandName, int progargc, char *progargv[]) {
         argv[i++] = strdup([mainClassName UTF8String]);
 
     for (NSString *argument in arguments) {
-        argument = [argument stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:[mainBundle bundlePath]];
+        argument = [argument stringByReplacingOccurrencesOfString:@APP_ROOT_PREFIX withString:mainBundlePath];
         argv[i++] = strdup([argument UTF8String]);
     }
 
