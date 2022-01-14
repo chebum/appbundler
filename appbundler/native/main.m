@@ -124,24 +124,14 @@ int main(int argc, char *argv[]) {
 }
 
 
-size_t get_free_ram_size() {
-    mach_port_t host_port;
-    mach_msg_type_number_t host_size;
-    vm_size_t pagesize;
-
-    host_port = mach_host_self();
-    host_size = sizeof(vm_statistics_data_t) / sizeof(integer_t);
-    host_page_size(host_port, &pagesize);
-
-    vm_statistics_data_t vm_stat;
-
-    if (host_statistics(host_port, HOST_VM_INFO, (host_info_t)&vm_stat, &host_size) != KERN_SUCCESS) {
-        Log(@"Failed to fetch vm statistics");
-    }
-    
-    __uint64_t mem_free = (((__uint64_t)(vm_stat.free_count + vm_stat.inactive_count)) * pagesize) / 1048576;
-    
-    return (size_t) mem_free;
+size_t get_ram_size() {
+     int mib[2] = {CTL_HW, HW_MEMSIZE};
+     int64_t physical_memory;
+     size_t length = sizeof(int64_t);
+     if(sysctl(mib, 2, &physical_memory, &length, NULL, 0)==0) {
+         return physical_memory / 1048576;
+     }
+     return 0;
 }
 
 
@@ -608,35 +598,22 @@ int launch(char *commandName, int progargc, char *progargv[]) {
             setenv([key UTF8String], [newValue UTF8String], 1);
         }
     }
-    
-    int ram_size = get_free_ram_size(),
-        max_xmx_value = MAX(ram_size / 2, 250);
-    Log(@"Replacing any maximum memory parameters that specify a percentage of available ram: %u", ram_size);
+
+    // Replacing any maximum memory parameters that specify a percentage of available ram
     for(int i=0; i<options.count; i++) {
-        NSString* option = [options objectAtIndex:i];
-        if([option hasPrefix:@"-Xmx"]) {
-            if([option hasSuffix:@"%"]) {
-                if (ram_size <=0) {
-                    Log(@"Cannot find free memory, removing Xmx parameter");
-                    [options removeObjectAtIndex:i];
-                    continue;
-                }
-                
-                NSString* percentAmtStr = [option substringWithRange:NSMakeRange(4, option.length-5)];
-                double percentAmt = percentAmtStr.doubleValue;
-                if(percentAmt >= 1 && percentAmt <= 95) {
-                    int ramToUse = (percentAmt/100) * ram_size;
-                    [options replaceObjectAtIndex:i withObject:[NSString stringWithFormat:@"-Xmx%dm", ramToUse]];
-                }
-            } else {
-                NSString* amtStr = [option substringWithRange:NSMakeRange(4, option.length-5)];
-                int amt = amtStr.intValue;
-                if (amt > max_xmx_value) {
-                    [options replaceObjectAtIndex:i withObject:[NSString stringWithFormat:@"-Xmx%dm", max_xmx_value]];
-                }
-            }
-        }
-    }
+		NSString* option = [options objectAtIndex:i];
+		if([option hasPrefix:@"-Xmx"] && [option hasSuffix:@"%"]) {
+			NSString* percentAmtStr = [option substringWithRange:NSMakeRange(4, option.length-5)];
+			double percentAmt = percentAmtStr.doubleValue;
+			if(percentAmt >= 1 && percentAmt <= 200.0001) {
+				size_t ram_size = get_ram_size();
+				if(ram_size > 0 ) {
+					size_t ramToUse = (ram_size * percentAmt / 100);
+					[options replaceObjectAtIndex:i withObject:[NSString stringWithFormat:@"-Xmx%zum", ramToUse]];
+				}
+			}
+		}
+	}
     
     Log(@"Initialize the arguments to JLI_Launch()");
     // +5 due to the special directories and the sandbox enabled property
